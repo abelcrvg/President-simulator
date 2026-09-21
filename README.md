@@ -22,7 +22,7 @@ Você controla um candidato durante uma eleição. A campanha acontece em ciclos
 ```bash
 pkg install nodejs
 cd ~/projetos
- git clone https://github.com/abelcrvg/President-simulator.git
+git clone https://github.com/abelcrvg/President-simulator.git
 cd President-simulator
 cp .env.example .env
 npm install
