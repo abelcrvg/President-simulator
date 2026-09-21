@@ -5,13 +5,24 @@ const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3001);
-const AI_PROVIDER = process.env.AI_PROVIDER || 'ollama';
 const AI_URL = process.env.AI_URL || 'http://127.0.0.1:11434/api/chat';
 const AI_MODEL = process.env.AI_MODEL || 'qwen3:8b';
 
+// Baseline is intentionally fictional: the point is internal consistency, not
+// a forecast of any real country's economy.
+const BASE_ECONOMY = {
+  gdp: 10_000_000_000_000,
+  revenue: 3_200_000_000_000,
+  expenditure: 3_300_000_000_000,
+  debt: 7_500_000_000_000,
+  inflation: 4.5,
+  unemployment: 7.0,
+  interest: 10.0
+};
+
 const initial = {
   day: 1,
-  candidate: { name: 'Você', party: 'Partido da Mudança', funds: 1000000 },
+  candidate: { name: 'Você', party: 'Partido da Mudança', funds: 1_000_000 },
   opponents: [
     { id:'ana', name:'Ana Martins', party:'Partido Social', ideology:'centro-esquerda', support:25 },
     { id:'bruno', name:'Bruno Costa', party:'Partido Liberal', ideology:'centro-direita', support:22 },
@@ -21,11 +32,15 @@ const initial = {
   approval:50,
   polling: { you:38, ana:25, bruno:22, carla:15 },
   promises: [] as any[],
-  events: [{type:'system', title:'Campanha iniciada', text:'A eleição começou. Suas decisões, debates, promessas e crises vão alterar a opinião dos eleitores.'}],
+  economy: { ...BASE_ECONOMY, deficit: BASE_ECONOMY.expenditure - BASE_ECONOMY.revenue, fiscalHeadroom: 100_000_000_000 },
+  events: [{type:'system', title:'Campanha iniciada', text:'A eleição começou. Promessas serão avaliadas pelo impacto fiscal, econômico, social e político. O benefício eleitoral nunca é calculado isoladamente.'}],
   chat: [] as any[]
 };
 
 let state = structuredClone(initial);
+
+const clamp=(n:number,min=0,max=100)=>Math.min(max,Math.max(min,n));
+const money=(n:number)=>Math.round(n/1_000_000)*1_000_000;
 
 function impactFromText(text:string){
   const t=text.toLowerCase();
@@ -38,11 +53,87 @@ function impactFromText(text:string){
   return impact;
 }
 
+function extractAmount(text:string){
+  const t=text.toLowerCase().replace(/\./g,'').replace(/,/g,'.');
+  const matches=[...t.matchAll(/r\$\s*(\d+(?:\.\d+)?)\s*(milh(?:ão|ões)|bilh(?:ão|ões)|mil)?/gi)];
+  if(!matches.length)return null;
+  let total=0;
+  for(const m of matches){ const n=Number(m[1]); const unit=m[2]||''; total += unit.startsWith('bilh') ? n*1e9 : unit.startsWith('milh') ? n*1e6 : unit==='mil' ? n*1e3 : n; }
+  return total;
+}
+
+function estimatePromise(text:string){
+  const t=text.toLowerCase();
+  const explicit=extractAmount(text);
+  let annualCost=0;
+  let beneficiaries=0;
+  let confidence='estimativa';
+
+  // Recognize common benefit language. Explicit R$ values are preferred.
+  if(/bolsa|auxílio|benefício|renda mínima/.test(t)){
+    const monthly=explicit || 2_000;
+    const people=Number((t.match(/(\d+(?:[.,]\d+)?)\s*(?:milh(?:ão|ões)|mil|pessoas|famílias)/)?.[1]||'10').replace(',','.'));
+    const rawUnit=(t.match(/\d+(?:[.,]\d+)?\s*(milh(?:ão|ões)|mil|pessoas|famílias)/)?.[1]||'mil');
+    beneficiaries=rawUnit.startsWith('milh')?people*1e6:rawUnit==='mil'?people*1e3:people;
+    annualCost=monthly*12*beneficiaries;
+    confidence='estimativa por benefício mensal';
+  } else if(explicit){
+    annualCost=explicit;
+    confidence='valor explícito da promessa';
+  } else if(/construir|construção|hospital|escola|ferrovia|rodovia|creche|universidade/.test(t)){
+    annualCost=200_000_000;
+    confidence='estimativa por programa de investimento';
+  } else if(/aumentar|criar|reduzir|isentar|subsidiar|gratuit/.test(t)){
+    annualCost=100_000_000;
+    confidence='estimativa preliminar';
+  }
+
+  annualCost=money(annualCost);
+  const fiscalRatio=annualCost/BASE_ECONOMY.revenue;
+  const debtImpact=annualCost;
+  const inflationRisk=clamp(fiscalRatio*120,0,12);
+  const growthEffect=/investimento|infraestrutura|emprego|produtiv/.test(t) ? clamp(annualCost/BASE_ECONOMY.gdp*180,0,4) : 0;
+  const socialBenefit=/bolsa|auxílio|saúde|hospital|educa|escola|creche|salário|renda/.test(t) ? clamp(annualCost/BASE_ECONOMY.gdp*80,0,8) : 2;
+  const fiscalStress=clamp(fiscalRatio*100,0,100);
+  const politicalAppeal=clamp(socialBenefit - fiscalStress*0.35 + growthEffect*0.5, -15, 12);
+
+  return {annualCost,beneficiaries,confidence,fiscalRatio,debtImpact,inflationRisk,growthEffect,socialBenefit,fiscalStress,politicalAppeal};
+}
+
+function recalculateEconomy(){
+  const recurring=state.promises.reduce((sum:number,p:any)=>sum+(p.estimate?.annualCost||0),0);
+  const deficit=BASE_ECONOMY.expenditure + recurring - BASE_ECONOMY.revenue;
+  const debt=BASE_ECONOMY.debt + Math.max(0,deficit)*Math.max(1,state.day/30);
+  const fiscalRatio=recurring/BASE_ECONOMY.revenue;
+  state.economy={
+    ...state.economy,
+    revenue:BASE_ECONOMY.revenue,
+    expenditure:BASE_ECONOMY.expenditure+recurring,
+    deficit,
+    debt,
+    inflation:clamp(BASE_ECONOMY.inflation + fiscalRatio*18 + state.economy.inflationRiskAdjustment,0,30),
+    unemployment:clamp(BASE_ECONOMY.unemployment - state.promises.reduce((s:number,p:any)=>s+(p.estimate?.growthEffect||0)*0.15,0),2,25),
+    fiscalHeadroom:Math.max(0,BASE_ECONOMY.revenue-BASE_ECONOMY.expenditure-recurring)
+  };
+}
+
+function recalculatePolitics(){
+  const promiseAppeal=state.promises.reduce((s:number,p:any)=>s+(p.estimate?.politicalAppeal||0),0);
+  const fiscalPenalty=state.promises.reduce((s:number,p:any)=>s+Math.max(0,(p.estimate?.fiscalStress||0)-3)*0.18,0);
+  const economyPenalty=Math.max(0,state.economy.inflation-BASE_ECONOMY.inflation)*0.7;
+  state.approval=clamp(50+promiseAppeal-fiscalPenalty-economyPenalty,0,100);
+  const p=clamp(state.approval*.55+20,1,70);
+  const remainder=100-p;
+  const others=state.opponents.reduce((s:any,o:any)=>s+o.support,0);
+  state.polling.you=Math.round(p*10)/10;
+  state.opponents.forEach((o:any)=>state.polling[o.id]=Math.max(0.5,Math.round(o.support*remainder/others*10)/10));
+}
+
 function localAi(prompt:string){
   const lower=prompt.toLowerCase();
   if(lower.includes('debate')) return 'Você fala primeiro. Seu adversário reage com uma pergunta direta sobre sua proposta e tenta explorar qualquer contradição do seu discurso.';
-  if(lower.includes('reportagem')) return 'URGENTE — A campanha ganhou repercussão. Analistas destacam que sua última declaração será debatida nas redes e pode mudar a percepção de eleitores indecisos.';
-  return 'A campanha continua. Uma decisão sua pode gerar efeitos positivos em um grupo de eleitores e custos políticos em outro.';
+  if(lower.includes('reportagem')) return 'BOLETIM — A campanha ganhou repercussão. Analistas discutem custos, viabilidade e efeitos das propostas apresentadas.';
+  return 'A campanha continua. Uma decisão pode gerar benefícios para determinados grupos e custos econômicos ou políticos para outros.';
 }
 
 async function ai(prompt:string){
@@ -63,30 +154,29 @@ app.post('/api/reset',(_,res)=>{ state=structuredClone(initial); res.json(state)
 app.post('/api/action', async (req,res)=>{
   const {type,text}=req.body || {};
   if(type==='promise'){
+    const estimate=estimatePromise(text||'');
     const impact=impactFromText(text||'');
-    state.promises.push({text,day:state.day,impact});
-    Object.keys(impact).forEach(k=>state.issues[k as keyof typeof state.issues]=Math.min(100,Math.max(0,state.issues[k as keyof typeof state.issues]+impact[k])));
-    state.approval=Math.min(100,Math.max(0,state.approval+1));
-    state.events.unshift({type:'promise',title:'Nova promessa',text});
+    state.promises.push({text,day:state.day,impact,estimate});
+    Object.keys(impact).forEach(k=>state.issues[k as keyof typeof state.issues]=clamp(state.issues[k as keyof typeof state.issues]+impact[k]));
+    state.events.unshift({type:'promise',title:'Nova promessa — análise fiscal',text:`${text} | Custo anual estimado: R$ ${estimate.annualCost.toLocaleString('pt-BR')}. Pressão fiscal: ${estimate.fiscalStress.toFixed(1)}%. ${estimate.confidence}.`});
+    recalculateEconomy();
+    recalculatePolitics();
   }
   if(type==='day'){
     state.day++;
+    recalculateEconomy();
     const volatility=(Math.random()-.5)*6;
-    state.approval=Math.min(100,Math.max(0,Math.round(state.approval+volatility)));
-    const p=Math.round(state.approval*.55+20);
-    const remainder=100-p;
-    const others=state.opponents.reduce((s:any,o:any)=>s+o.support,0);
-    state.polling.you=p;
-    state.opponents.forEach((o:any)=>state.polling[o.id]=Math.max(1,Math.round(o.support*remainder/others)));
-    const report=await ai(`Crie uma reportagem curta para o dia ${state.day} de uma eleição presidencial fictícia. Contexto: aprovação ${state.approval}; promessas recentes: ${state.promises.slice(-3).map((p:any)=>p.text).join(' | ')}. Mostre reações de candidatos, imprensa e eleitores sem favorecer ninguém.`);
+    state.approval=clamp(state.approval+volatility);
+    recalculatePolitics();
+    const report=await ai(`Crie uma reportagem curta para o dia ${state.day} de uma eleição presidencial fictícia. Economia: inflação ${state.economy.inflation.toFixed(1)}%, déficit R$ ${state.economy.deficit.toLocaleString('pt-BR')}, dívida R$ ${state.economy.debt.toLocaleString('pt-BR')}. Últimas promessas e custos: ${state.promises.slice(-3).map((p:any)=>`${p.text} (R$ ${p.estimate?.annualCost?.toLocaleString('pt-BR')||0}/ano)`).join(' | ')}. Mostre reações e questionamentos sobre viabilidade sem favorecer ninguém.`);
     state.events.unshift({type:'news',title:`Boletim eleitoral — Dia ${state.day}`,text:report});
   }
   if(type==='debate'){
-    const reply=await ai(`Simule um debate presidencial fictício. O jogador acabou de dizer: "${text}". Responda como ${state.opponents[0].name}, que é uma candidata fictícia. Faça uma réplica de até 120 palavras, ataque ideias e peça detalhes verificáveis, sem insultos pessoais. Termine com uma pergunta.`);
+    const reply=await ai(`Simule um debate presidencial fictício. O jogador acabou de dizer: "${text}". Dados fiscais atuais: déficit R$ ${state.economy.deficit.toLocaleString('pt-BR')}; inflação ${state.economy.inflation.toFixed(1)}%; custo anual acumulado das promessas R$ ${state.promises.reduce((n:number,p:any)=>n+(p.estimate?.annualCost||0),0).toLocaleString('pt-BR')}. Responda como ${state.opponents[0].name}, candidata fictícia. Questione números, financiamento e efeitos das propostas, sem insultos pessoais. Termine com uma pergunta.`);
     state.chat.push({role:'opponent',name:state.opponents[0].name,text:reply,day:state.day});
   }
   if(type==='statement'){
-    const reply=await ai(`Analise esta declaração de campanha fictícia: "${text}". Gere uma reação de jornalistas, eleitores favoráveis, críticos e indecisos. Explique possíveis efeitos na campanha sem prever um resultado eleitoral real.`);
+    const reply=await ai(`Analise esta declaração de campanha fictícia: "${text}". Considere também a situação fiscal: déficit R$ ${state.economy.deficit.toLocaleString('pt-BR')}, inflação ${state.economy.inflation.toFixed(1)}% e custo anual das promessas R$ ${state.promises.reduce((n:number,p:any)=>n+(p.estimate?.annualCost||0),0).toLocaleString('pt-BR')}. Gere reação de jornalistas, eleitores favoráveis, críticos e indecisos. Não preveja resultado eleitoral real.`);
     state.events.unshift({type:'news',title:'Repercussão da declaração',text:reply});
   }
   res.json(state);
