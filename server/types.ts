@@ -8,3 +8,4 @@ export interface AgendaItem{id:string;day:number;time:string;type:AgendaType;tit
 export interface CampaignEvent{type:string;title:string;text:string;day:number;importance?:number;}
 export interface DebateMessage{eventId:string;role:'player'|'opponent'|'journalist'|'moderator';speaker:string;text:string;day:number;}
 export interface Polling{you:number;ana:number;bruno:number;carla:number;}
+export interface PolicyPlan{id:string;title:string;category:string;summary:string;details:string;annualCost:number;revenueEffect:number;politicalRisks:string[];economicEffects:string[];journalistAngles:string[];}
